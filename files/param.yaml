@@ -24,8 +24,8 @@ strategy-parameters:
 
   itm_strike_range: 400
 
-  trade_expiry: "2026-04-28"
-  pcr_expiry: "2026-04-28"
+  trade_expiry: "2026-05-05"
+  pcr_expiry: "2026-05-05"
   pcr_poll_interval_sec: 120
 
   max_atr_for_contract: 20
