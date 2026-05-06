@@ -645,10 +645,16 @@ class UpstoxOrderManager:
         if entry_price is None or sl_trigger is None or sl_limit is None:
             raise ValueError(f"entry_price/sl_trigger/sl_limit must be numeric. got entry_price={entry_price}, sl_trigger={sl_trigger}, sl_limit={sl_limit}")
 
+        existing_trade = self.get_open_trade(symbol=symbol)
+        if existing_trade is not None:
+            logger.warning(f"[SKIP] Open trade exists for {symbol}. Not opening another.")
+            return str(existing_trade["id"])
+
         if trail_points is not None:
             trail_points = _safe_float(trail_points, None)
         if start_trail_after is not None:
             start_trail_after = _safe_float(start_trail_after, None)
+        trailing_active = trail_points is not None and trail_points > 0 and start_trail_after is not None
 
         trade_id,tag_entry = self.place_market_entry(
                                     symbol=symbol,
@@ -663,7 +669,7 @@ class UpstoxOrderManager:
                                     target=target,
                                     stoploss_trigger=sl_trigger,
                                     stoploss_limit=sl_limit,
-                                    tsl_active=True,
+                                    tsl_active=trailing_active,
                                     trail_points=trail_points,
                                     start_trail_after=start_trail_after,
                                     ts=ts,
@@ -748,7 +754,7 @@ class UpstoxOrderManager:
             "entry_spot": float(entry_price),
             "spot_ltp": float(entry_price),
             "_spot_trail_anchor": None,
-            "_trail_points": trail_points,
+            "_trail_points": float(trail_points) if trail_points is not None else None,
             "status": "OPEN",
             "timestamp": ts.isoformat(),
             "exit_price": None,
@@ -775,7 +781,8 @@ class UpstoxOrderManager:
                 "transaction_type": side,
                 "price": float(entry_price),
                 "trigger_price": float(entry_price),
-                "trail_points": float(trail_points),
+                "trail_points": float(trail_points) if trail_points is not None else None,
+                "tsl_active": bool(tsl_active),
                 "tag": tag_entry,
             },
         )
@@ -1090,7 +1097,7 @@ class UpstoxOrderManager:
                         "TSL_UPDATE_FAILED",
                         t,
                         ts=ts,
-                        response=response,
+                        extra={"response": response},
                     )
                     return False
 
@@ -1182,17 +1189,17 @@ class UpstoxOrderManager:
 
     # ----------------------------- on_tick management -----------------------------
 
-    def on_tick(self, *, symbol: str,  o: float, h: float, l: float, c: float, ts: Optional[datetime] = None, force_trail=False) -> None:
+    def on_tick(self, *, symbol: str,  o: float, h: float, l: float, c: float, ts: Optional[datetime] = None, force_trail=False) -> bool:
 
         ts = _ensure_tz(ts)
         t = self.get_open_trade(symbol=symbol)
         if not t:
-            return
+            return False
 
         # broker sync first (prevents trailing spam after SL hit)
         self.refresh_trade_status(t["id"], ts=ts)
         if str(t.get("status", "")).upper() != "OPEN":
-            return
+            return False
 
         side = str(t.get("side", "")).upper()
 
@@ -1205,7 +1212,7 @@ class UpstoxOrderManager:
                 if resp == constants.SUCCESS:
                     logger.info(f"Exited position for trade_id={t['id']} due to target hit")
                     self._close_trade(trade_id=t["id"], exit_price=float(target), ts=ts, reason=constants.TARGET_HIT)
-                    return
+                    return False
                 else:
                     logger.warning(f"Failed to exit position for trade_id={t['id']} on target hit: {resp}")
         else:
@@ -1214,7 +1221,7 @@ class UpstoxOrderManager:
                 if resp == constants.SUCCESS:
                     logger.info(f"Exited position for trade_id={t['id']} due to target hit")
                     self._close_trade(trade_id=t["id"], exit_price=float(target), ts=ts, reason=constants.TARGET_HIT)
-                    return
+                    return False
                 else:
                     logger.warning(f"Failed to exit position for trade_id={t['id']} on target hit: {resp}")
 
@@ -1224,7 +1231,7 @@ class UpstoxOrderManager:
             logger.info(f"Force SL trailing for trade_id={t['id']} with latest_ltp: {latest_ltp}")
             if side != "BUY":
                 logger.info(f"Force SL trailing skipped for trade_id={t['id']} side={side}")
-                return
+                return False
 
             force_trail_points = _safe_float(
                 self.strategy_parameters.get(
@@ -1242,7 +1249,7 @@ class UpstoxOrderManager:
                     f"Force SL trailing skipped for trade_id={t['id']} because "
                     f"new_trigger={new_trigger} latest_ltp={latest_ltp}"
                 )
-                return
+                return False
 
             new_limit = float(new_trigger) - float(self.tsl_buffer)
 
@@ -1263,7 +1270,7 @@ class UpstoxOrderManager:
                 f"Force SL trailing {'updated' if ok else 'failed'} for trade_id={t['id']} "
                 f"new_trigger={new_trigger} new_limit={new_limit}"
             )
-            return
+            return bool(ok)
 
         # trailing (local) -> then modify on broker
         #
@@ -1335,16 +1342,17 @@ class UpstoxOrderManager:
                             logger.info(f"Anchor point for next trailing {anchor_spot}")
 
                     else:
-                        return
+                        return False
 
                 else:
                     # SELL / short: side code to be written
-                    return
+                    return False
                     
             else:
-                return
+                return False
 
         self._upsert_trade_row(t)
+        return False
 
     # ----------------------------- exits -----------------------------
 

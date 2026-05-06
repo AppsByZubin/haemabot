@@ -4,6 +4,7 @@ import os
 import yaml
 import pandas as pd
 import math
+from threading import RLock
 from zoneinfo import ZoneInfo
 import common.constants as constants
 import logger
@@ -63,6 +64,11 @@ class HmEmaAdxStrategy:
         self.last_fut_bar: Optional[Dict] = None
         self.future_data_from_parquet = False
         self.last_index_bar: Optional[Dict] = None
+        self._fut_vol_minute = None
+        self._fut_vol_start_vtt = None
+        self._fut_vol_last_vtt = None
+        self._fut_vol_by_minute: Dict[str, float] = {}
+        self._candle_lock = RLock()
 
         # DataFrames (initialized with fixed dtypes to avoid warnings)
         self.df_index_future = pd.DataFrame({
@@ -73,6 +79,13 @@ class HmEmaAdxStrategy:
             "close": pd.Series(dtype="float64"),
             "volume": pd.Series(dtype="float64"),
             "oi": pd.Series(dtype="float64")
+        })
+
+        self.df_merged = pd.DataFrame({
+            "time": pd.Series(dtype="object"),
+            "close": pd.Series(dtype="float64"),
+            "close_fut": pd.Series(dtype="float64"),
+            "volume_fut": pd.Series(dtype="float64"),
         })
 
         self.params = params if isinstance(params, dict) else self._get_params_from_yaml()
@@ -501,13 +514,14 @@ class HmEmaAdxStrategy:
         if ltp is None or ltt is None:
             return None
 
-        option_greeks = market_ff.get("optionGreeks") or first_level.get("optionGreeks") or {}
+        option_greeks = market_ff.get("optionGreeks") or market_ff.get("greeks") or first_level.get("optionGreeks") or {}
         return {
             "instrument_key": instrument_key,
             "ltp": ltp,
             "ltt": int(ltt),
             "ts_epoch_ms": int(ltt),
             "oi": safe_float(market_ff.get("oi") or first_level.get("oi")),
+            "vtt": safe_float(market_ff.get("vtt")),
             "gamma": safe_float(option_greeks.get("gamma")),
         }
 
@@ -554,7 +568,13 @@ class HmEmaAdxStrategy:
             ltp = safe_float(item.get("ltp"))
             if ltp is None:
                 return
-            self._handle_fut_tick(minute_key, float(ltp))
+            with self._candle_lock:
+                vtt = safe_float(item.get("vtt"))
+                if vtt is not None:
+                    finished_minute, finished_vol = self._update_1m_volume_from_vtt(minute_key, vtt)
+                    if finished_minute is not None:
+                        self._fut_vol_by_minute[finished_minute] = float(finished_vol)
+                self._handle_fut_tick(minute_key, float(ltp))
             return
 
         ltp = safe_float(item.get("ltp"))
@@ -563,53 +583,60 @@ class HmEmaAdxStrategy:
         self.atr5_engine.on_tick(str(instrument_key), float(ltp), dt_object)
 
     def on_ws_message(self, message: Dict[str, Any]):
+        feed_response = self._normalize_feed_response(message)
+        if not feed_response:
+            return
+
         # Order lifecycle gets a chance on every WS message
         try:
-            self._trade_processing_from_ws(message)
+            self._trade_processing_from_ws(feed_response)
         except Exception as e:
             logger.warning(f"_trade_processing_from_ws error: {e}")
 
-        if not isinstance(message, dict) or "feeds" not in message:
-            return
-
-        feeds = message["feeds"]
-        if not isinstance(feeds, dict):
-            return
-
-        current_ts = safe_float(message.get("currentTs"))
-        for ik, data in feeds.items():
+        for item in feed_response:
             try:
-                item = self._normalize_feed_item(ik, data, current_ts)
-                if item is None:
-                    continue
-
-                ltp = safe_float(item.get("ltp"))
-                ts_ms_f = safe_float(item.get("ts_epoch_ms"))
-                if ts_ms_f is None:
-                    ts_ms_f = safe_float(item.get("ltt"))
-                if ltp is None or ts_ms_f is None:
-                    continue
-
-                ts_ms = int(ts_ms_f)
-                minute_key = datetime.fromtimestamp(ts_ms / 1000, ist).strftime("%Y-%m-%d %H:%M")
-
-                # Index tick
-                if ik == constants.NIFTY50_SYMBOL:
-                    self._handle_index_tick(minute_key, float(ltp))
-                elif self.index_fur_key and ik == self.index_fur_key:
-                    # Futures tick
-                    self._handle_fut_tick(minute_key, float(ltp))
-                else:
-                    # Option tick -> update ATR stream for dynamic risk sizing.
-                    dt_object = datetime.fromtimestamp(ts_ms / 1000, ist)
-                    self.atr5_engine.on_tick(str(ik), float(ltp), dt_object)
+                self._handle_normalized_feed_item(item)
             except Exception as e:
-                logger.warning(f"Skipping malformed feed for {ik}: {e}")
+                logger.warning(f"Skipping malformed feed for {item.get('instrument_key')}: {e}")
                 continue
 
     # ------------------------------------------------------------------
     # Candle building
     # ------------------------------------------------------------------
+    def _update_1m_volume_from_vtt(self, minute_key: str, vtt_now: float):
+        """
+        Compute one-minute traded volume from cumulative future VTT.
+        Returns the completed minute and its volume when the tick rolls forward.
+        """
+        try:
+            if self._fut_vol_minute is None:
+                self._fut_vol_minute = minute_key
+                self._fut_vol_start_vtt = vtt_now
+                self._fut_vol_last_vtt = vtt_now
+                return None, None
+
+            if self._fut_vol_last_vtt is not None and vtt_now < float(self._fut_vol_last_vtt):
+                self._fut_vol_minute = minute_key
+                self._fut_vol_start_vtt = vtt_now
+                self._fut_vol_last_vtt = vtt_now
+                return None, None
+
+            if minute_key == self._fut_vol_minute:
+                self._fut_vol_last_vtt = vtt_now
+                return None, None
+
+            finished_minute = self._fut_vol_minute
+            finished_volume = max(float(self._fut_vol_last_vtt) - float(self._fut_vol_start_vtt), 0.0)
+
+            self._fut_vol_minute = minute_key
+            self._fut_vol_start_vtt = vtt_now
+            self._fut_vol_last_vtt = vtt_now
+
+            return finished_minute, finished_volume
+        except Exception as e:
+            logger.error(f"Error in _update_1m_volume_from_vtt: {e}")
+            return None, None
+
     def _upsert_future_candle(self, candle: Dict[str, Any]) -> None:
         minute_key = str(candle.get("time") or "")
         if not minute_key:
@@ -647,91 +674,134 @@ class HmEmaAdxStrategy:
             self.df_index_future = pd.concat([self.df_index_future, pd.DataFrame([row])], ignore_index=True)
 
     def _finalize_fut_candle(self) -> None:
-        if self.curr_fut_candle is None:
-            return
-        logger.info(f"Finalizing future candle: {self.curr_fut_candle}")
-        self._upsert_future_candle(self.curr_fut_candle)
-        self.last_fut_bar = dict(self.curr_fut_candle)
-        self.curr_fut_candle = None
+        with self._candle_lock:
+            candle = self.curr_fut_candle
+            if candle is None:
+                return
+
+            candle = dict(candle)
+            self.curr_fut_candle = None
+            minute = str(candle.get("time") or "")
+            if minute in self._fut_vol_by_minute:
+                candle["volume"] = float(self._fut_vol_by_minute.pop(minute, 0.0))
+            logger.info(f"Finalizing future candle: {candle}")
+            self._upsert_future_candle(candle)
+            self.last_fut_bar = candle
+            self._try_make_merged_bar()
 
     def _handle_fut_tick(self, minute_key: str, ltp: float) -> None:
         """Build 1-minute OHLC for FUT using ltp."""
         try:
-            if minute_key is None:
-                return
-            minute_key = str(minute_key)
+            with self._candle_lock:
+                if minute_key is None:
+                    return
+                minute_key = str(minute_key)
 
-            ltp_f = safe_float(ltp)
-            if ltp_f is None or ltp_f <= 0:
-                return
+                ltp_f = safe_float(ltp)
+                if ltp_f is None or ltp_f <= 0:
+                    return
 
-            if self.curr_fut_minute != minute_key:
-                if self.curr_fut_candle is not None:
-                    try:
-                        self._finalize_fut_candle()
-                    except Exception as e:
-                        logger.error(f"Error in _finalize_fut_candle: {e}")
+                if self.curr_fut_minute != minute_key:
+                    if self.curr_fut_candle is not None:
+                        try:
+                            self._finalize_fut_candle()
+                        except Exception as e:
+                            logger.error(f"Error in _finalize_fut_candle: {e}")
 
-                self.curr_fut_minute = minute_key
-                self.curr_fut_candle = {
-                    "time": minute_key,
-                    "open": ltp_f,
-                    "high": ltp_f,
-                    "low": ltp_f,
-                    "close": ltp_f,
-                    "volume": 0.0,
-                    "oi": float("nan"),
-                }
-                return
+                    self.curr_fut_minute = minute_key
+                    self.curr_fut_candle = {
+                        "time": minute_key,
+                        "open": ltp_f,
+                        "high": ltp_f,
+                        "low": ltp_f,
+                        "close": ltp_f,
+                        "volume": 0.0,
+                        "oi": float("nan"),
+                    }
+                    return
 
-            c = self.curr_fut_candle
-            if c is None:
-                return
+                c = self.curr_fut_candle
+                if c is None:
+                    return
 
-            c["high"] = max(float(c.get("high", ltp_f)), ltp_f)
-            c["low"] = min(float(c.get("low", ltp_f)), ltp_f)
-            c["close"] = ltp_f
+                c["high"] = max(float(c.get("high", ltp_f)), ltp_f)
+                c["low"] = min(float(c.get("low", ltp_f)), ltp_f)
+                c["close"] = ltp_f
         except Exception as e:
             logger.error(f"Error in _handle_fut_tick: {e}")
 
     def _handle_index_tick(self, minute_key: str, ltp: float):
         """Aggregate spot ticks into 1-minute OHLC candles."""
-        
-        # New minute?
-        if self.curr_index_minute is None or minute_key != self.curr_index_minute:
-            # finalize previous candle if exists
-            if self.curr_index_candle is not None:
-                self._finalize_index_candle()
+        with self._candle_lock:
+            # New minute?
+            if self.curr_index_minute is None or minute_key != self.curr_index_minute:
+                # finalize previous candle if exists
+                if self.curr_index_candle is not None:
+                    self._finalize_index_candle()
 
-            # start new candle
-            self.curr_index_minute = minute_key
-            self.curr_index_candle = {
-                "time": minute_key,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp,
-            }
-            # Compute day gap from first observed tick/candle open for the day.
-            day_key = self._extract_day_key(minute_key)
-            if day_key and self._gap_day != day_key:
-                self._update_gap_stats(self.curr_index_candle)
-        else:
-            c = self.curr_index_candle
-            c["high"] = max(c["high"], ltp)
-            c["low"] = min(c["low"], ltp)
-            c["close"] = ltp
+                # start new candle
+                self.curr_index_minute = minute_key
+                self.curr_index_candle = {
+                    "time": minute_key,
+                    "open": ltp,
+                    "high": ltp,
+                    "low": ltp,
+                    "close": ltp,
+                }
+                # Compute day gap from first observed tick/candle open for the day.
+                day_key = self._extract_day_key(minute_key)
+                if day_key and self._gap_day != day_key:
+                    self._update_gap_stats(self.curr_index_candle)
+            else:
+                c = self.curr_index_candle
+                if c is None:
+                    return
+                c["high"] = max(c["high"], ltp)
+                c["low"] = min(c["low"], ltp)
+                c["close"] = ltp
     
 
     def _finalize_index_candle(self):
         """Persist completed candle and run dependent analytics."""
-        c = self.curr_index_candle
-        if c is None:
+        with self._candle_lock:
+            c = self.curr_index_candle
+            if c is None:
+                return
+
+            c = dict(c)
+            self.curr_index_candle = None
+            logger.info(f"Current minute:{self.curr_index_minute}, Finalizing index candle: {c}")
+            self.df_index = pd.concat([self.df_index, pd.DataFrame([c])], ignore_index=True)
+            self.last_index_bar = c
+            self._try_make_merged_bar()
+
+            if self.index_fur_key is None:
+                self._apply_indicators_and_engine()
+
+    def _try_make_merged_bar(self) -> None:
+        if self.last_index_bar is None or self.last_fut_bar is None:
             return
-        logger.info(f"Current minute:{self.curr_index_minute}, Finalizing index candle: {c}")
-        self.df_index = pd.concat([self.df_index, pd.DataFrame([c])], ignore_index=True)
-        self.last_index_bar = c
-        self.curr_index_candle = None
+        if self.last_index_bar.get("time") != self.last_fut_bar.get("time"):
+            return
+
+        row = {
+            "time": self.last_index_bar["time"],
+            "close": float(self.last_index_bar.get("close", np.nan)),
+            "close_fut": float(self.last_fut_bar.get("close", np.nan)),
+            "volume_fut": float(self.last_fut_bar.get("volume", np.nan)),
+        }
+
+        if self.df_merged.empty:
+            self.df_merged = pd.DataFrame([row])
+        else:
+            matched = self.df_merged.index[self.df_merged["time"].astype(str) == str(row["time"])]
+            if len(matched) > 0:
+                idx = matched[-1]
+                for col, value in row.items():
+                    self.df_merged.at[idx, col] = value
+            else:
+                self.df_merged = pd.concat([self.df_merged, pd.DataFrame([row])], ignore_index=True)
+
         self._apply_indicators_and_engine()
 
     # ------------------------------------------------------------------
@@ -1448,7 +1518,7 @@ class HmEmaAdxStrategy:
 
         return output
 
-    def _trade_processing_from_ws(self, message: Any) -> None:
+    def _trade_processing_from_ws(self, feed_response: List[Dict[str, Any]]) -> None:
         st = self._order_container.get("status")
         needs_wait_pick = (
             self._order_container.get("side") is not None
@@ -1459,7 +1529,6 @@ class HmEmaAdxStrategy:
         if not (needs_wait_pick or needs_open_manage):
             return
 
-        feed_response = self._normalize_feed_response(message)
         if not feed_response:
             return
 

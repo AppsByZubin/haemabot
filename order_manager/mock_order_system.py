@@ -862,10 +862,16 @@ class MockOrderManager:
         if entry_price is None or sl_trigger is None or sl_limit is None:
             raise ValueError(f"entry_price/sl_trigger/sl_limit must be numeric. got entry_price={entry_price}, sl_trigger={sl_trigger}, sl_limit={sl_limit}")
 
+        existing_trade = self.get_open_trade(symbol=symbol)
+        if existing_trade is not None:
+            logger.warning(f"[SKIP] Open trade exists for {symbol}. Not opening another.")
+            return str(existing_trade["id"])
+
         if trail_points is not None:
             trail_points = _safe_float(trail_points, None)
         if start_trail_after is not None:
             start_trail_after = _safe_float(start_trail_after, None)
+        trailing_active = trail_points is not None and trail_points > 0 and start_trail_after is not None
 
         trade_id = self.place_market_entry(
             symbol=symbol,
@@ -880,7 +886,7 @@ class MockOrderManager:
             target=target,
             stoploss_trigger=sl_trigger,
             stoploss_limit=sl_limit,
-            tsl_active=True,
+            tsl_active=trailing_active,
             trail_points=trail_points,
             start_trail_after=start_trail_after,
             ts=ts,
@@ -917,6 +923,17 @@ class MockOrderManager:
         entry_slices: int = 1,
         sl_slices: int = 1,
     ) -> str:
+        existing_trade = self.get_open_trade(symbol=symbol)
+        if existing_trade is not None:
+            logger.warning(f"[SKIP] Open trade exists for {symbol}. Not opening another.")
+            return str(existing_trade["id"])
+
+        if trail_points is not None:
+            trail_points = _safe_float(trail_points, None)
+        if start_trail_after is not None:
+            start_trail_after = _safe_float(start_trail_after, None)
+        trailing_active = trail_points is not None and trail_points > 0 and start_trail_after is not None
+
         trade_id = self.place_market_entry(
             symbol=symbol,
             instrument_token=instrument_token,
@@ -930,7 +947,7 @@ class MockOrderManager:
             target=target,
             stoploss_trigger=sl_trigger,
             stoploss_limit=sl_limit,
-            tsl_active=True,
+            tsl_active=trailing_active,
             trail_points=trail_points,
             start_trail_after=start_trail_after,
             ts=ts,
