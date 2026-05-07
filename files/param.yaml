@@ -57,8 +57,8 @@ strategy-parameters:
 
 historical-trends: &historical_trends
   weekly: "super_bearish"
-  daily: "bearish"
-  trader-sentiment: "bearish"
+  daily: "bullish"
+  trader-sentiment: "bullish"
 
 # Backward-compatible alias
 historical-trend: *historical_trends
