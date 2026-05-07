@@ -29,6 +29,22 @@ ist = ZoneInfo("Asia/Kolkata")
 logger = create_logger("Nifty50EngineLogger")
 
 
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in {"1", "true", "yes", "y", "on"}:
+            return True
+        if norm in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 def nifty50_engine(strategy, mode, param_data):
     """
     Fixes:
@@ -48,6 +64,23 @@ def nifty50_engine(strategy, mode, param_data):
         sp = (param_data or {}).get("strategy-parameters", {}) if isinstance(param_data, dict) else {}
     except Exception:
         sp = {}
+
+    def _get_strategy_param(*names, default=None):
+        sources = [sp]
+        if isinstance(param_data, dict):
+            sources.append(param_data)
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for name in names:
+                if name in source:
+                    return source.get(name)
+        return default
+
+    oil_track_enabled = _coerce_bool(
+        _get_strategy_param("OIL_TRACK", "oil_track", default=False),
+        False,
+    )
 
     WS_IDLE_TIMEOUT_SEC = int(sp.get("ws_idle_timeout_sec", 20))
     WATCHDOG_CHECK_EVERY_SEC = int(sp.get("ws_watchdog_check_sec", 5))
@@ -227,6 +260,20 @@ def nifty50_engine(strategy, mode, param_data):
             logger.error("Failed to fetch upcoming NIFTY future contract.")
             sys.exit(constants.FAIL_CODE)
 
+        oil_contract = None
+        if oil_track_enabled:
+            oil_contract = upstox.get_crudeoil_future_contract(
+                query=str(_get_strategy_param("OIL_QUERY", "oil_query", default="Crudeoil")),
+                expiry=str(_get_strategy_param("OIL_EXPIRY", "oil_expiry", default="current_month")),
+                exchanges=str(_get_strategy_param("OIL_EXCHANGES", "oil_exchanges", default="MCX")),
+                segments=str(_get_strategy_param("OIL_SEGMENTS", "oil_segments", default="FUT")),
+                selected_index=int(_get_strategy_param("OIL_SELECT", "oil_select", default=0) or 0),
+            )
+            logger.info(
+                f"Crude oil tracking enabled. instrument_key={oil_contract.get('instrument_key')} "
+                f"trading_symbol={oil_contract.get('trading_symbol')}"
+            )
+
         if last_day_close ==0:
             last_day_close = get_spot_price(upstox, constants.NIFTY50, constants.NIFTY50_SYMBOL)
 
@@ -245,8 +292,10 @@ def nifty50_engine(strategy, mode, param_data):
         selected_contracts = {}
         intraday_day_1min_candles = []
         intraday_day_future_candles = []
+        intraday_day_oil_candles = []
         minutes_processed = {}
         future_minutes_processed = {}
+        oil_minutes_processed = {}
 
         # time gates
         now_ist = datetime.now(ist)
@@ -300,6 +349,11 @@ def nifty50_engine(strategy, mode, param_data):
             future_data.reverse()
             intraday_day_future_candles.extend(future_data)
 
+            if oil_track_enabled and oil_contract is not None:
+                oil_data = get_instrument_intraday_data(upstox, oil_contract["instrument_key"])
+                oil_data.reverse()
+                intraday_day_oil_candles.extend(oil_data)
+
         # Close the streamer at market end (15:30 IST) and generate a monthly summary.
         def market_close_watcher():
             while not stop_event.is_set():
@@ -347,19 +401,29 @@ def nifty50_engine(strategy, mode, param_data):
             future_dt = datetime.fromisoformat(future_last_timestamp).astimezone(ist)
             future_minutes_processed[future_dt.strftime("%Y-%m-%d %H:%M")] = True
 
+        df_oil = pd.DataFrame()
+        if intraday_day_oil_candles:
+            df_oil = pd.DataFrame(intraday_day_oil_candles, columns=columns)
+            oil_last_timestamp = df_oil["time"].iloc[-1]
+            oil_dt = datetime.fromisoformat(oil_last_timestamp).astimezone(ist)
+            oil_minutes_processed[oil_dt.strftime("%Y-%m-%d %H:%M")] = True
+
         # instruments list
         list_of_instruments = []
         if not isinstance(selected_contracts, dict):
             logger.error("Failed to initialize selected contracts.")
             sys.exit(constants.FAIL_CODE)
         selected_contracts["Nifty_Future"] = future_contract
+        if oil_track_enabled and oil_contract is not None:
+            selected_contracts["CrudeOil_Future"] = oil_contract
 
         for key, value in selected_contracts.items():
-            if key == "Nifty_Future":
+            if isinstance(value, dict) and value.get("instrument_key"):
                 list_of_instruments.append(value["instrument_key"])
                 continue
-            for contract in value:
-                list_of_instruments.append(contract["instrument_key"])
+            if isinstance(value, list):
+                for contract in value:
+                    list_of_instruments.append(contract["instrument_key"])
 
         if strategy == constants.HM_EMA_ADX:
             from index.nifty50.strategy import HmEmaAdxStrategy
@@ -374,8 +438,10 @@ def nifty50_engine(strategy, mode, param_data):
                 selected_contracts=selected_contracts,
                 index_minutes_processed=minutes_processed,
                 future_minutes_processed=future_minutes_processed,
+                oil_minutes_processed=oil_minutes_processed,
                 intraday_index_candles=intraday_day_1min_candles,
                 intraday_future_candles=intraday_day_future_candles,
+                intraday_oil_candles=intraday_day_oil_candles,
             )
         else:
             logger.error(f"Strategy {strategy} is not available in haemabot.")

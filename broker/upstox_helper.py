@@ -23,6 +23,8 @@ import common.constants as constants
 
 logger =create_logger("UpstoxHelperLogger")
 
+UPSTOX_INSTRUMENT_SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
+
 class UpstoxHelper:
     """
     Helper class for Upstox API operations.
@@ -138,6 +140,124 @@ class UpstoxHelper:
             return api_response
         except Exception as e:
             raise Exception(f"Failed to fetch option contracts: {e}")
+
+    def search_instruments(
+        self,
+        query,
+        expiry="current_month",
+        atm_offset=0,
+        page_number=1,
+        records=20,
+        exchanges="MCX",
+        segments="FUT",
+        instrument_types=None,
+        timeout=15.0,
+    ):
+        """
+        Search instruments using Upstox instruments/search.
+
+        Notes:
+        - Mirrors the commodity lookup flow used by the crude oil websocket
+          playground script.
+        - Upstox can return commodity futures via segments=FO with
+          instrument_types=FUT, so we retry with that shape when FUT is empty.
+        """
+        params = {
+            "query": query,
+            "expiry": expiry,
+            "atm_offset": atm_offset,
+            "page_number": page_number,
+            "records": records,
+            "exchanges": exchanges,
+            "segments": segments,
+        }
+        if instrument_types:
+            params["instrument_types"] = instrument_types
+
+        def _fetch(fetch_params):
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.apiAccessToken}",
+            }
+            response = requests.get(
+                UPSTOX_INSTRUMENT_SEARCH_URL,
+                headers=headers,
+                params=fetch_params,
+                timeout=timeout,
+            )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Instrument search returned non-JSON HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                ) from exc
+
+            if response.status_code != 200 or payload.get("status") != constants.SUCCESS:
+                raise RuntimeError(
+                    f"Instrument search failed with HTTP {response.status_code}: {payload}"
+                )
+            return payload.get("data") or []
+
+        instruments = _fetch(params)
+        if instruments:
+            return instruments
+
+        if instrument_types is None and str(segments).upper() == "FUT":
+            fallback_params = dict(params)
+            fallback_params["segments"] = "FO"
+            fallback_params["instrument_types"] = "FUT"
+            logger.info(
+                "No instruments found with segments=FUT. Retrying with "
+                "segments=FO&instrument_types=FUT."
+            )
+            return _fetch(fallback_params)
+
+        return instruments
+
+    def get_crudeoil_future_contract(
+        self,
+        query="Crudeoil",
+        expiry="current_month",
+        exchanges="MCX",
+        segments="FUT",
+        selected_index=0,
+    ):
+        """
+        Return the selected MCX crude oil future contract from instruments/search.
+        """
+        instruments = self.search_instruments(
+            query=query,
+            expiry=expiry,
+            exchanges=exchanges,
+            segments=segments,
+        )
+        if not instruments:
+            raise RuntimeError(
+                f"No instruments found for query={query!r}, expiry={expiry!r}, "
+                f"exchanges={exchanges!r}, segments={segments!r}"
+            )
+
+        selected_index = int(selected_index or 0)
+        if selected_index < 0 or selected_index >= len(instruments):
+            raise IndexError(
+                f"selected_index={selected_index} is out of range for "
+                f"{len(instruments)} returned instruments"
+            )
+
+        instrument = instruments[selected_index]
+        instrument_key = instrument.get("instrument_key")
+        if not instrument_key:
+            raise RuntimeError(f"Selected crude oil instrument has no instrument_key: {instrument}")
+
+        logger.info(
+            "Selected crude oil future instrument_key=%s trading_symbol=%s expiry=%s",
+            instrument_key,
+            instrument.get("trading_symbol"),
+            instrument.get("expiry"),
+        )
+        return instrument
     
 
     def get_holday_list(self):
@@ -413,5 +533,4 @@ class UpstoxHelper:
 
         except Exception as e:
             raise Exception(f"Failed to fetch LTP: {e}")
-
 
