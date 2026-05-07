@@ -52,7 +52,7 @@ strategy-parameters:
     large: 10
 
   trade-window:
-    start: "09:45"
+    start: "10:30"
     end: "15:00"
 
 historical-trends: &historical_trends
